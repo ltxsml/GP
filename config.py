@@ -5,7 +5,7 @@ LastEditors: GodK
 import time
 
 common = {
-    "exp_name": "CMeEE",
+    "exp_name": "CMeIE",
     "encoder": "BERT",
     "num_workers": 0,
     "data_home": "./datasets",
@@ -29,10 +29,10 @@ train_config = {
     "path_to_save_model": "./outputs",  # 在logger不是wandb时生效
     "hyper_parameters": {
         "lr": 2e-5,
-        "batch_size": 16,
+        "batch_size": 64,
         "epochs": 20,
         "seed": 2333,
-        "max_seq_len": 400,
+        "max_seq_len": 128,
         "scheduler": "CAWR"  # CAWR, Step, None
     }
 }
