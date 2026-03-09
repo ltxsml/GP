@@ -114,7 +114,7 @@ class JointExtractionLoss(nn.Module):
         return total_loss, loss_ent, loss_rel, loss_scl
     
 
-    
+
 class JointCascadeGlobalPointer(nn.Module):
     def __init__(self, encoder, ent_type_size, rel_type_size, inner_dim, RoPE=True):
         super().__init__()
@@ -146,7 +146,7 @@ class JointCascadeGlobalPointer(nn.Module):
         embeddings = embeddings.reshape(seq_len, output_dim)
         return embeddings.unsqueeze(0).expand(batch_size, seq_len, output_dim)
 
-    def compute_gp_matrix(self, hidden_states, dense_layer, type_size, attention_mask):
+    def compute_gp_matrix(self, hidden_states, dense_layer, type_size, attention_mask, mask_tril=True):
         """复用的 Global Pointer 矩阵计算核心逻辑"""
         batch_size, seq_len = hidden_states.shape[:2]
         device = hidden_states.device
@@ -168,8 +168,11 @@ class JointCascadeGlobalPointer(nn.Module):
         logits = torch.einsum('bmhd,bnhd->bhmn', qw, kw)
         pad_mask = attention_mask.unsqueeze(1).unsqueeze(1).expand_as(logits)
         logits = logits * pad_mask - (1 - pad_mask) * 1e12
-        mask = torch.tril(torch.ones_like(logits), -1)
-        logits = logits - mask * 1e12
+        # mask = torch.tril(torch.ones_like(logits), -1)
+        # logits = logits - mask * 1e12
+        if mask_tril:
+            mask = torch.tril(torch.ones_like(logits), -1)
+            logits = logits - mask * 1e12
         return logits / self.inner_dim ** 0.5
 
     def forward(self, input_ids, attention_mask, token_type_ids):
@@ -181,12 +184,15 @@ class JointCascadeGlobalPointer(nn.Module):
         enhanced_state = self.boundary_attention(last_hidden_state, attention_mask)
 
         # 3. 第一级抽取：实体识别 (Entity Extraction)
-        ent_logits = self.compute_gp_matrix(enhanced_state, self.ent_dense, self.ent_type_size, attention_mask)
+        ent_logits = self.compute_gp_matrix(enhanced_state, self.ent_dense, self.ent_type_size, attention_mask,mask_tril=True)
+
+        # 第二步：【修复位置】先通过 Sigmoid 将分值映射到 0~1，消除 -1e12 的巨量负数影响
+        ent_prob = torch.sigmoid(ent_logits)
 
         # 4. 特征融合：将实体预测的分布特征映射回隐藏空间作为关系抽取的先验
         # ent_logits 的形状为 [batch, ent_type, seq_len, seq_len]
         # 我们对其在尾部维度进行 pooling 或 max，提取每个 token 的实体倾向性
-        ent_prior, _ = torch.max(ent_logits, dim=-1) # [batch, ent_type, seq_len]
+        ent_prior, _ = torch.max(ent_prob, dim=-1) # [batch, ent_type, seq_len]
         ent_prior = ent_prior.transpose(1, 2)        # [batch, seq_len, ent_type]
         ent_prior_features = torch.relu(self.rel_prior_proj(ent_prior))
 
@@ -195,7 +201,7 @@ class JointCascadeGlobalPointer(nn.Module):
 
         # 5. 第二级抽取：关系识别 (Relation Extraction)
         # 关系矩阵：(batch, rel_type_size, seq_len(头实体), seq_len(尾实体))
-        rel_logits = self.compute_gp_matrix(rel_hidden_state, self.rel_dense, self.rel_type_size, attention_mask)
+        rel_logits = self.compute_gp_matrix(rel_hidden_state, self.rel_dense, self.rel_type_size, attention_mask,mask_tril=False)
 
         # 返回实体 logits，关系 logits，以及用于对比学习的增强特征
         return ent_logits, rel_logits, enhanced_state
