@@ -12,7 +12,7 @@ common = {
     "bert_path": "C:\\Users\\26854\\.cache\\huggingface\\hub\\models--Bert-base-chinese\\snapshots\\8f23c25b06e129b6c986331a13d8d025a92cf0ea",  # bert-base-chinese or other plm from https://huggingface.co/models
     "run_type": "train",  # train, eval
     "f1_2_save": 0.5,  # 存模型的最低f1值
-    "logger": "default"  # wandb or default，default意味着只输出日志到控制台
+    "logger": "wandb"  # wandb or default，default意味着只输出日志到控制台
 }
 
 # wandb的配置，只有在logger=wandb时生效。用于可视化训练过程

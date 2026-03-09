@@ -81,7 +81,7 @@ class SupervisedContrastiveLoss(nn.Module):
 
 
 class JointExtractionLoss(nn.Module):
-    def __init__(self, lambda_scl=0.1):
+    def __init__(self, lambda_scl=0.2):
         super().__init__()
         self.lambda_scl = lambda_scl
         self.scl_loss_fn = SupervisedContrastiveLoss()
@@ -116,7 +116,9 @@ class JointExtractionLoss(nn.Module):
 
 
 class JointCascadeGlobalPointer(nn.Module):
-    def __init__(self, encoder, ent_type_size, rel_type_size, inner_dim, RoPE=True):
+    def __init__(self, encoder, ent_type_size, rel_type_size, inner_dim, 
+                 use_boundary_attn=True,# 边界感知开关
+                 RoPE=True):
         super().__init__()
         self.encoder = encoder
         self.ent_type_size = ent_type_size
@@ -181,7 +183,11 @@ class JointCascadeGlobalPointer(nn.Module):
         last_hidden_state = context_outputs[0] 
 
         # 2. 边界感知注意力增强 (取代原本直接传入 dense 层)
-        enhanced_state = self.boundary_attention(last_hidden_state, attention_mask)
+        # 根据开关判断是否执行增强
+        if self.use_boundary_attn:
+            enhanced_state = self.boundary_attention(last_hidden_state, attention_mask)
+        else:
+            enhanced_state = last_hidden_state
 
         # 3. 第一级抽取：实体识别 (Entity Extraction)
         ent_logits = self.compute_gp_matrix(enhanced_state, self.ent_dense, self.ent_type_size, attention_mask,mask_tril=True)
