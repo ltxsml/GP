@@ -19,8 +19,28 @@ from models.GlobalPointer import MyDataset, MetricsCalculator
 # 导入我们新建的联合抽取组件 (假设你把上一轮的代码放在了这个文件里)
 from models.JointGlobalPointer import JointCascadeGlobalPointer, DataMakerJoint, JointExtractionLoss
 
-# 读取配置
+
+import argparse
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# --- 新增命令行参数解析 ---
+parser = argparse.ArgumentParser(description="联合抽取消融实验")
+# parser.add_argument('--exp_name', type=str, default='Group_A_Full')
+parser.add_argument('--use_boundary_attn', type=str, default='True')
+parser.add_argument('--lambda_scl', type=float, default=0.1)
+args = parser.parse_args()
+
+# --- 读取配置并覆盖 ---
 conf = config.train_config
+hyper_parameters = conf["hyper_parameters"]
+
+# 用命令行参数覆盖默认配置
+# conf["exp_name"] = args.exp_name
+use_boundary_attn_bool = True if args.use_boundary_attn == 'True' else False
+
+# 读取配置
+# conf = config.train_config
 hyper_parameters = conf["hyper_parameters"]
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -93,10 +113,10 @@ def data_generator():
 # 初始化模型与损失函数
 encoder = BertModel.from_pretrained(conf["bert_path"])
 # 参数: encoder, 实体类别数, 关系类别数, inner_dim
-model = JointCascadeGlobalPointer(encoder, ent_type_size, rel_type_size, inner_dim=64)
+model = JointCascadeGlobalPointer(encoder, ent_type_size, rel_type_size, inner_dim=64,use_boundary_attn=use_boundary_attn_bool)
 model = model.to(device)
 
-criterion = JointExtractionLoss(lambda_scl=0.1) # 联合损失函数，λ可调
+criterion = JointExtractionLoss(lambda_scl=args.lambda_scl) # 联合损失函数，λ可调
 metrics = MetricsCalculator()
 
 def train_step(batch_data, model, optimizer, criterion):
@@ -150,7 +170,7 @@ def train(model, dataloader, epoch, optimizer):
                 "loss_contrastive": l_scl,
                 "learning_rate": optimizer.param_groups[0]['lr']
             })
-
+    return avg_loss
 def valid(model, dataloader):
     model.eval()
     
@@ -200,20 +220,61 @@ def valid(model, dataloader):
             "valid_rel_f1": rel_f1, "valid_rel_p": rel_p, "valid_rel_r": rel_r
         })
         
-    # 我们以 关系抽取的 F1 作为主要标准 (因为关系对了，实体通常也对了)
-    return rel_f1 
+    # 
+    return ent_f1, rel_f1
+
+
+import matplotlib.pyplot as plt
+
+def plot_simplified_metrics(history, save_path="training_results.png"):
+    """
+    只绘制总 Loss 和两个 F1 分数的简化版图表
+    """
+    epochs = range(1, len(history['total_loss']) + 1)
+    plt.figure(figsize=(12, 5)) # 调整为适合并排显示两张图的比例
+
+    # 左图：总 Loss 曲线
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, history['total_loss'], 'b-o', label='Total Loss', linewidth=2)
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss Value')
+    plt.legend()
+    plt.grid(True, linestyle=':', alpha=0.6)
+
+    # 右图：实体与关系的 F1 曲线
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history['ent_f1'], 'r-s', label='Entity F1')
+    plt.plot(epochs, history['rel_f1'], 'g-o', label='Relation F1')
+    plt.title('Validation F1 Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.ylim(0, 1.0) # F1 分数固定在 0 到 1 之间
+    plt.legend()
+    plt.grid(True, linestyle=':', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    print(f"图表已成功生成并保存至: {save_path}")
 
 if __name__ == '__main__':
     if conf["run_type"] == "train":
         train_dataloader, valid_dataloader = data_generator()
 
+        history = {
+        'total_loss': [], 
+        'ent_f1': [], 
+        'rel_f1': []
+    }
         optimizer = torch.optim.Adam(model.parameters(), lr=float(hyper_parameters["lr"]))
         max_rel_f1 = 0.
         
         for epoch in range(hyper_parameters["epochs"]):
-            train(model, train_dataloader, epoch, optimizer)
-            current_rel_f1 = valid(model, valid_dataloader)
-            
+            avg_loss=train(model, train_dataloader, epoch, optimizer)
+            ent_f1, current_rel_f1 = valid(model, valid_dataloader)
+            history['total_loss'].append(avg_loss)
+            history['ent_f1'].append(ent_f1)
+            history['rel_f1'].append(current_rel_f1)
             # 根据联合抽取中最重要的关系抽取 F1 值来保存模型
             if current_rel_f1 > max_rel_f1:
                 max_rel_f1 = current_rel_f1
@@ -224,3 +285,6 @@ if __name__ == '__main__':
                     print(f"--> Saved best model to {save_path}")
             
             print(f"Best Relation F1 so far: {max_rel_f1:.4f}")
+        plot_simplified_metrics(history)
+
+

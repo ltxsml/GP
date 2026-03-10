@@ -126,7 +126,7 @@ class JointCascadeGlobalPointer(nn.Module):
         self.inner_dim = inner_dim
         self.hidden_size = encoder.config.hidden_size
         self.RoPE = RoPE
-
+        self.use_boundary_attn = use_boundary_attn
         # 创新点1：加入边界感知注意力
         self.boundary_attention = BoundaryAwareAttention(self.hidden_size)
 
