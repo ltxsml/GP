@@ -89,7 +89,7 @@ if __name__ == '__main__':
     
     # 3. 指定你训练出来的最好的模型权重路径
     # 请将下面这个路径替换为 outputs 文件夹下那个 F1 最高的 .pt 文件路径
-    best_model_path = "outputs/Group_A_Full_joint/xxxx-xx-xx_xx.xx.xx/joint_model_x_f1_0.xxxx.pt" 
+    best_model_path = "outputs\CMeIE_joint\\2026-03-08_16.55.24\joint_model_0_f1_0.6000.pt" 
     
     print(f"Loading best model from: {best_model_path}")
     model.load_state_dict(torch.load(best_model_path, map_location=device))
