@@ -426,8 +426,13 @@ model = JointCascadeGlobalPointer(encoder, ent_type_size, rel_type_size, inner_d
                                   use_dynamic_gate=use_dynamic_gate_bool)
 model = model.to(device)
 
-criterion = JointExtractionLoss()
+criterion = JointExtractionLoss().to(device)
 metrics = MetricsCalculator()
+optimizer_params = [
+        {'params': model.parameters()},
+        {'params': criterion.parameters(), 'weight_decay': 0.0}
+    ]
+optimizer = torch.optim.Adam(optimizer_params, lr=float(hyper_parameters["lr"]))
 
 def train_step(batch_data, model, optimizer, criterion):
     # 彻底修复：只解包 6 个返回值
@@ -450,7 +455,6 @@ def train_step(batch_data, model, optimizer, criterion):
     
     total_loss.backward()
     optimizer.step()
-
     # 只返回三个 loss
     return total_loss.item(), loss_ent.item(), loss_rel.item()
 
@@ -570,13 +574,23 @@ def plot_simplified_metrics(history, save_path=save_path):
 if __name__ == '__main__':
     if conf["run_type"] == "train":
         train_dataloader, valid_dataloader = data_generator()
+        # 定义日志路径
+    log_txt_path = os.path.join(model_state_dict_dir, "loss_scales_log.txt")
+    
+    # 写入表头（覆盖原有文件）
+    with open(log_txt_path, 'w', encoding='utf-8') as f:
+        f.write("epoch\ts1\ts2\tent_f1\trel_f1\n")
 
         history = {
         'total_loss': [], 
         'ent_f1': [], 
         'rel_f1': []
         }
-        optimizer = torch.optim.Adam(model.parameters(), lr=float(hyper_parameters["lr"]))
+        optimizer_params = [
+            {'params': model.parameters()},
+            {'params': criterion.parameters(), 'weight_decay': 0.0}
+        ]
+        optimizer = torch.optim.Adam(optimizer_params, lr=float(hyper_parameters["lr"]))
         # ====== CAWR 调度器 ======
         scheduler = None
         if hyper_parameters.get("scheduler") == "CAWR":
@@ -588,6 +602,17 @@ if __name__ == '__main__':
         for epoch in range(hyper_parameters["epochs"]):
             avg_loss=train(model, train_dataloader, epoch, optimizer)
             ent_f1, current_rel_f1 = valid(model, valid_dataloader, epoch)
+            # --- 新增：记录 s1 和 s2 ---
+            # 提取参数值并转为 CPU 列表
+            # s1, s2 分别对应实体和关系的对数方差参数
+            scales = criterion.loss_scales.detach().cpu().numpy()
+            s1, s2 = scales[0], scales[1]
+            
+            # 以追加模式写入 txt
+            with open(log_txt_path, 'a', encoding='utf-8') as f:
+                f.write(f"{epoch+1}\t{s1:.6f}\t{s2:.6f}\t{ent_f1:.4f}\t{current_rel_f1:.4f}\n")
+            
+            print(f"--> Epoch {epoch+1} scales saved: s1={s1:.4f}, s2={s2:.4f}")
             # ====== 每个 Epoch 结束后更新一次学习率 ======
             if scheduler is not None:
                 scheduler.step()
