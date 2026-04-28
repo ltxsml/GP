@@ -5,41 +5,54 @@ import torch.nn.functional as F
 import numpy as np
 
 class BoundaryAwareAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads=4):
+    """
+    基于特征差分的显式边界感知模块 (Explicit Boundary Difference)
+    替代容易造成特征平滑的CNN，直接计算相邻Token的特征梯度，实现NLP领域的"边缘检测"。
+    """
+    def __init__(self, hidden_size):
         super().__init__()
-        self.num_heads = num_heads
         self.hidden_size = hidden_size
         
-        # 多头注意力用于边界特征交互
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
-        # 边界门控网络
-        self.boundary_gate = nn.Linear(hidden_size, hidden_size)
+        # 将左右差分特征映射回高维空间
+        self.diff_proj = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # 动态门控：只有在发生显著语义突变的边界处，才注入差分特征，防止在实体内部引入噪声
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.Sigmoid()
+        )
+        
         self.layer_norm = nn.LayerNorm(hidden_size)
 
     def forward(self, hidden_states, attention_mask):
-        # 将 attention_mask 转换为 MultiheadAttention 需要的 key_padding_mask (True 表示需要被 mask 掉)
-        key_padding_mask = (attention_mask == 0)
+        # 1. 构造平移特征 (获取 x_{i-1} 和 x_{i+1})
+        # 右移：获取左侧邻居 x_{i-1}，第一个位置用自身补齐
+        x_prev = torch.cat([hidden_states[:, :1, :], hidden_states[:, :-1, :]], dim=1)
+        # 左移：获取右侧邻居 x_{i+1}，最后一个位置用自身补齐
+        x_next = torch.cat([hidden_states[:, 1:, :], hidden_states[:, -1:, :]], dim=1)
         
-        # 1. 全局边界特征交互
-        attn_output, _ = self.attention(
-            query=hidden_states, 
-            key=hidden_states, 
-            value=hidden_states, 
-            key_padding_mask=key_padding_mask
-        )
+        # 2. 计算特征空间的离散梯度 (提取真正的语义边缘)
+        diff_left = hidden_states - x_prev  # 左侧突变 (识别实体起始 Start)
+        diff_right = hidden_states - x_next # 右侧突变 (识别实体结束 End)
         
-        # 2. 边界门控机制：学习哪些 Token 更可能是边界
-        gate = torch.sigmoid(self.boundary_gate(attn_output))
+        # 3. 提取边界信号与计算门控
+        boundary_signal = self.diff_proj(torch.cat([diff_left, diff_right], dim=-1))
+        gate_value = self.gate(torch.cat([hidden_states, diff_left, diff_right], dim=-1))
         
-        # 3. 增强边界特征并残差连接
-        enhanced_states = self.layer_norm(hidden_states + gate * attn_output)
-        return enhanced_states
+        # 4. 残差注入与层归一化
+        enhanced_states = self.layer_norm(hidden_states + gate_value * boundary_signal)
+        return enhanced_states, None
     
 
 class JointExtractionLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, alpha=1.0):
         super().__init__()
         self.loss_scales = nn.Parameter(torch.tensor([0.0, 0.0]))
+        self.alpha = alpha
 
     def multilabel_categorical_crossentropy(self, y_pred, y_true):
         """标准的 Global Pointer 稀疏多标签交叉熵损失"""
@@ -62,8 +75,7 @@ class JointExtractionLoss(nn.Module):
         precision_ent = torch.exp(-self.loss_scales[0])
         precision_rel = torch.exp(-self.loss_scales[1])
 
-        # 总损失 = 实体损失 + 关系损失
-        # total_loss = loss_ent + loss_rel
+        # 基础的多任务自动平衡损失
         total_loss = (precision_ent * loss_ent + self.loss_scales[0]) + \
                      (precision_rel * loss_rel + self.loss_scales[1])
         
@@ -202,6 +214,10 @@ class JointCascadeGlobalPointer(nn.Module):
         
         # 3. 关系先验投影层
         self.rel_prior_proj = nn.Linear(self.ent_type_size, self.hidden_size)
+        # 【新增】尾部类型投影层：为尾部 Token 注入类型特征
+        self.tail_type_proj = nn.Linear(self.ent_type_size, self.hidden_size)
+        # 【新增】尾部上下文投影层：用于整合实体的尾部跨度信息
+        self.tail_context_proj = nn.Linear(self.hidden_size, self.hidden_size)
 
         # 4. 动态门控网络
         if self.use_dynamic_gate:
@@ -210,8 +226,8 @@ class JointCascadeGlobalPointer(nn.Module):
                 nn.Sigmoid() 
             )
 
-        # 5. 关系抽取层：输入维度固定为 hidden_size * 3 (原始 + 先验 + Span语义)
-        self.rel_dense = nn.Linear(self.hidden_size * 3, self.rel_type_size * self.inner_dim * 2)
+        # 5. 关系抽取层：输入维度固定为 hidden_size * 2 (原始 + 先验)
+        self.rel_dense = nn.Linear(self.hidden_size * 2, self.rel_type_size * self.inner_dim * 2)
 
     def sinusoidal_position_embedding(self, batch_size, seq_len, output_dim, device):
         position_ids = torch.arange(0, seq_len, dtype=torch.float, device=device).unsqueeze(-1)
@@ -241,8 +257,12 @@ class JointCascadeGlobalPointer(nn.Module):
             kw = kw * cos_pos + kw2 * sin_pos
 
         logits = torch.einsum('bmhd,bnhd->bhmn', qw, kw)
-        pad_mask = attention_mask.unsqueeze(1).unsqueeze(1).expand_as(logits)
+        
+        # 【深度修正】原版掩码仅能遮蔽 Tail 端的 PAD。当 mask_tril=False 时，会导致 Head 端预测出 PAD。
+        # 使用真实的二维十字掩码矩阵：同时遮蔽无效的 Head 和 Tail
+        pad_mask = attention_mask.unsqueeze(1).unsqueeze(2) * attention_mask.unsqueeze(1).unsqueeze(3)
         logits = logits * pad_mask - (1 - pad_mask) * 1e12
+        
         if mask_tril:
             mask = torch.tril(torch.ones_like(logits), -1)
             logits = logits - mask * 1e12
@@ -253,32 +273,52 @@ class JointCascadeGlobalPointer(nn.Module):
         context_outputs = self.encoder(input_ids, attention_mask, token_type_ids)
         last_hidden_state = context_outputs[0] 
 
-        # B. 边界增强
-        enhanced_state = self.boundary_attention(last_hidden_state, attention_mask) if self.use_boundary_attn else last_hidden_state
+        # B. 边界增强：利用 1D CNN 提取局部突变特征，对实体边界识别极其重要
+        if self.use_boundary_attn:
+            enhanced_state, _ = self.boundary_attention(last_hidden_state, attention_mask)
+        else:
+            enhanced_state = last_hidden_state
 
-        # C. 第一级：实体识别 (必须先计算以获取概率矩阵)
+        # C. 第一级：实体识别 (使用融合了边界信息的特征，从而提升 NER 准确率)
         ent_logits = self.compute_gp_matrix(enhanced_state, self.ent_dense, self.ent_type_size, attention_mask, mask_tril=True)
         ent_prob = torch.sigmoid(ent_logits) # [batch, ent_type, seq, seq]
 
-        # D. Span 语义注入 (基于实体预测的动态聚合)
-        span_prob_matrix = torch.max(ent_prob, dim=1)[0] # [batch, seq, seq]
-        span_semantics = torch.matmul(span_prob_matrix, enhanced_state) # [batch, seq, hidden_size]
-
         # E. 获取实体先验特征
-        ent_prior, _ = torch.max(ent_prob, dim=-1) 
-        ent_prior = ent_prior.transpose(1, 2) # [batch, seq, ent_type]
-        ent_prior_features = torch.relu(self.rel_prior_proj(ent_prior))
+        # 1. 基础头部先验：改回 max，将概率严格约束在 [0, 1]，防止长序列累加导致特征爆炸
+        ent_head_prior, _ = torch.max(ent_prob, dim=-1) # [batch, ent_type, seq_head]
+        ent_head_prior = ent_head_prior.transpose(1, 2) # [batch, seq_head, ent_type]
+        base_prior_features = torch.relu(self.rel_prior_proj(ent_head_prior))
+        
+        # 计算尾部类型先验，同样使用 max 约束
+        ent_tail_prior, _ = torch.max(ent_prob, dim=2) # [batch, ent_type, seq_tail]
+        ent_tail_prior = ent_tail_prior.transpose(1, 2) # [batch, seq_tail, ent_type]
+        tail_type_features = torch.relu(self.tail_type_proj(ent_tail_prior))
+        
+        # 【新增】将尾部类型特征注入到语义特征中
+        tail_aware_state = enhanced_state + tail_type_features
+
+        # 2. 科学的 Span-to-Head 跨度注意力机制 (必须进行加权归一化)
+        # 恢复 sum：保留实体类型维度的量子叠加态（解决一词多义重叠问题）
+        span_attn = torch.sum(ent_prob, dim=1) # [batch, seq_head, seq_tail] 
+        # 关键修正：对跨度注意力权重进行归一化，无论前面怎么叠加，总权重被压缩回 1.0 附近
+        span_attn_weights = span_attn / (torch.sum(span_attn, dim=-1, keepdim=True) + 1e-6)
+        
+        # 利用矩阵乘法，获取加权平均后的尾部上下文
+        tail_context = torch.matmul(span_attn_weights, tail_aware_state) 
+        tail_context_features = torch.relu(self.tail_context_proj(tail_context))
 
         # F. 动态门控提纯与特征融合
         if self.use_dynamic_gate:
+            # 3. 融合：既包含头部的类型概率先验，又包含了完整的尾部跨度语义
+            ent_prior_features = base_prior_features + tail_context_features
             gate_input = torch.cat([enhanced_state, ent_prior_features], dim=-1)
             gate_value = self.gate_network(gate_input) 
             final_ent_features = gate_value * ent_prior_features 
         else:
             final_ent_features = ent_prior_features
 
-        # 拼接 3 部分特征：原始语义 + 实体先验/门控 + Span 结构语义
-        rel_hidden_state = torch.cat([enhanced_state, final_ent_features, span_semantics], dim=-1)
+        # 拼接 2 部分特征：原始语义 + 实体先验/门控
+        rel_hidden_state = torch.cat([enhanced_state, final_ent_features], dim=-1)
 
         # G. 第二级：关系识别
         rel_logits = self.compute_gp_matrix(rel_hidden_state, self.rel_dense, self.rel_type_size, attention_mask, mask_tril=False)
@@ -352,6 +392,10 @@ class DataMakerJoint(object):
                         else:
                             # Cascade: 标注原有级联标签 (主宾首部对齐)
                             rel_labels[rel_id, s_s, o_s] = 1
+                            
+                        # 【核心修正】：存回 sample，供验证集的 decode 逻辑使用
+                        spo["s_tok_start"] = s_s
+                        spo["o_tok_start"] = o_s
 
             # 4. 转换为 Tensor
             input_ids = torch.tensor(inputs["input_ids"]).long()
@@ -441,8 +485,11 @@ class GPLinker(nn.Module):
             kw = kw * cos_pos + kw2 * sin_pos
 
         logits = torch.einsum('bmhd,bnhd->bhmn', qw, kw)
-        pad_mask = attention_mask.unsqueeze(1).unsqueeze(1).expand_as(logits)
+        
+        # 同样修正 GPLinker 中的 PAD 掩码逻辑
+        pad_mask = attention_mask.unsqueeze(1).unsqueeze(2) * attention_mask.unsqueeze(1).unsqueeze(3)
         logits = logits * pad_mask - (1 - pad_mask) * 1e12
+        
         if mask_tril:
             mask = torch.tril(torch.ones_like(logits), -1)
             logits = logits - mask * 1e12

@@ -119,6 +119,13 @@ class ImprovedGlobalPointer(nn.Module):
         # 2. 门控词汇融合 (创新点所在)
         fused_state = self.fusion(last_hidden_state, lex_features)
 
+        # --- 边界特征增强模块 ---
+        # 转置为 [batch, hidden_size, seq_len] 以适应 Conv1d
+        fused_state_t = fused_state.transpose(1, 2)
+        boundary_enhanced = self.boundary_conv(fused_state_t).transpose(1, 2)
+        fused_state = fused_state + torch.relu(boundary_enhanced) # 残差连接
+        # ------------------------
+
         # 3. 生成 Query 和 Key
         outputs = self.dense(fused_state)
         outputs = torch.split(outputs, self.inner_dim * 2, dim=-1)

@@ -51,7 +51,7 @@ def evaluate_on_test(model, dataloader):
     with torch.no_grad():
         for batch_data in tqdm(dataloader, desc="Testing"):
             (_, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
-             batch_ent_labels, batch_rel_labels, _) = batch_data
+             batch_ent_labels, batch_rel_labels) = batch_data
              
             batch_input_ids = batch_input_ids.to(device)
             batch_attention_mask = batch_attention_mask.to(device)
@@ -59,7 +59,7 @@ def evaluate_on_test(model, dataloader):
             batch_ent_labels = batch_ent_labels.to(device)
             batch_rel_labels = batch_rel_labels.to(device)
 
-            ent_logits, rel_logits, _ = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+            ent_logits, rel_logits = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
             
             eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels)
             ent_total_X += eX; ent_total_Y += eY; ent_total_Z += eZ

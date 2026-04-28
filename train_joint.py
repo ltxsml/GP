@@ -319,6 +319,7 @@ import sys
 import torch
 import json
 import time
+import numpy as np
 import glob
 from transformers import BertTokenizerFast, BertModel
 from tqdm import tqdm
@@ -470,9 +471,11 @@ def train_step(batch_data, model, optimizer, criterion, model_type="Cascade"):
         # 为了进度条显示兼容，将关系链接损失取平均
         loss_rel = (l_hh + l_tt) / 2
     else:
-        # Cascade 模式返回两个 Logits
         ent_logits, rel_logits = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
-        total_loss, loss_ent, loss_rel = criterion(ent_logits, batch_ent_labels, rel_logits, batch_rel_labels)
+        total_loss, loss_ent, loss_rel = criterion(
+            ent_logits, batch_ent_labels, 
+            rel_logits, batch_rel_labels
+        )
     
     total_loss.backward()
     optimizer.step()
@@ -503,79 +506,243 @@ def train(model, dataloader, epoch, optimizer, model_type="Cascade"):
             })
     return avg_loss
 
-def valid(model, dataloader, epoch, model_type="Cascade"):
+def decode_triples(rel_logits, threshold=0):
+    """
+    根据 GlobalPointer 的输出解码三元组坐标
+    返回格式: {(subject_start_token, object_start_token, relation_id), ...}
+    """
+    rel_logits = rel_logits.cpu().numpy()
+    pred_triples = set()
+    # 找到所有得分大于阈值的 (rel_id, start, end)
+    # 在你的 DataMakerJoint 中，rel_labels 的格式是 [rel_id, sub_start, obj_start]
+    for r_id, s_s, o_s in zip(*np.where(rel_logits > threshold)):
+        pred_triples.add((s_s, o_s, r_id))
+    return pred_triples
+
+def get_sample_category(spo_list):
+    """
+    根据 Ground Truth 判断样本重叠类型: Normal, SEO, EPO
+    """
+    if len(spo_list) <= 1:
+        return "Normal"
+    
+    entity_map = {}
+    pair_map = {}
+    is_seo, is_epo = False, False
+    
+    for spo in spo_list:
+        s_s, o_s = spo.get("s_tok_start"), spo.get("o_tok_start")
+        # 统计实体对 (判断 EPO: 同一对实体有多个关系)
+        pair = tuple(sorted((s_s, o_s))) if s_s is not None else None
+        if pair:
+            pair_map[pair] = pair_map.get(pair, 0) + 1
+            if pair_map[pair] > 1: is_epo = True
+        
+        # 统计单个实体 (判断 SEO: 一个实体参与多个三元组)
+        for ent in [s_s, o_s]:
+            if ent is not None:
+                entity_map[ent] = entity_map.get(ent, 0) + 1
+                if entity_map[ent] > 1: is_seo = True
+            
+    if is_epo: return "EPO"
+    if is_seo: return "SEO"
+    return "Normal"
+
+def is_long_triple(spo, threshold=6):
+    """
+    判断三元组中是否包含长实体 (基于字符跨度)
+    """
+    sub_len = spo.get("sub_end", 0) - spo.get("sub_start", 0)
+    obj_len = spo.get("obj_end", 0) - spo.get("obj_start", 0)
+    return sub_len > threshold or obj_len > threshold
+# def valid(model, dataloader, epoch, model_type="Cascade"):
+#     model.eval()
+    
+#     # 分别统计实体和关系的 X, Y, Z (预测正确数，预测总数，真实总数)
+#     ent_total_X, ent_total_Y, ent_total_Z = 0., 0., 0.
+#     rel_total_X, rel_total_Y, rel_total_Z = 0., 0., 0.
+    
+#     with torch.no_grad():
+#         for batch_data in tqdm(dataloader, desc="Validating"):
+#             if model_type == "GPLinker":
+#                 # GPLinker 模式解包 7 个值
+#                 (_, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
+#                  batch_ent_labels, batch_hh_labels, batch_tt_labels) = batch_data
+                
+#                 # 前向传播接收 3 个结果
+#                 ent_logits, hh_logits, tt_logits = model(
+#                     batch_input_ids.to(device), 
+#                     batch_attention_mask.to(device), 
+#                     batch_token_type_ids.to(device)
+#                 )
+                
+#                 # 评估实体
+#                 eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
+#                 ent_total_X += eX; ent_total_Y += eY; ent_total_Z += eZ
+                
+#                 # 评估关系 (以 Head-Head 链接作为关系存在性的代理指标)
+#                 rX, rY, rZ = metrics.get_evaluate_fpr(hh_logits, batch_hh_labels.to(device))
+#                 rel_total_X += rX; rel_total_Y += rY; rel_total_Z += rZ
+#             else:
+#                 # Cascade 模式解包 6 个值
+#                 (_, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
+#                  batch_ent_labels, batch_rel_labels) = batch_data
+                
+#                 ent_logits, rel_logits = model(
+#                     batch_input_ids.to(device), 
+#                     batch_attention_mask.to(device), 
+#                     batch_token_type_ids.to(device)
+#                 )
+                
+#                 # 评估实体
+#                 eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
+#                 ent_total_X += eX; ent_total_Y += eY; ent_total_Z += eZ
+                
+#                 # 评估关系
+#                 rX, rY, rZ = metrics.get_evaluate_fpr(rel_logits, batch_rel_labels.to(device))
+#                 rel_total_X += rX; rel_total_Y += rY; rel_total_Z += rZ
+
+#     # 1. 计算 Entity 指标
+#     ent_f1 = 2 * ent_total_X / (ent_total_Y + ent_total_Z) if (ent_total_Y + ent_total_Z) > 0 else 0
+#     ent_p = ent_total_X / ent_total_Y if ent_total_Y > 0 else 0
+#     ent_r = ent_total_X / ent_total_Z if ent_total_Z > 0 else 0
+    
+#     # 2. 计算 Relation 指标
+#     rel_f1 = 2 * rel_total_X / (rel_total_Y + rel_total_Z) if (rel_total_Y + rel_total_Z) > 0 else 0
+#     rel_p = rel_total_X / rel_total_Y if rel_total_Y > 0 else 0
+#     rel_r = rel_total_X / rel_total_Z if rel_total_Z > 0 else 0
+
+#     # 打印评估结果
+#     print("\n" + "="*40)
+#     print(f"Model Type: {model_type} | Epoch: {epoch + 1}")
+#     print(f"[Entity]   P: {ent_p:.4f}, R: {ent_r:.4f}, F1: {ent_f1:.4f}")
+#     print(f"[Relation] P: {rel_p:.4f}, R: {rel_r:.4f}, F1: {rel_f1:.4f}")
+#     print("="*40 + "\n")
+    
+#     # 记录到 Wandb
+#     if conf["logger"] == "wandb":
+#         logger.log({
+#             "epoch": epoch,
+#             "valid_ent_f1": ent_f1, "valid_ent_p": ent_p, "valid_ent_r": ent_r,
+#             "valid_rel_f1": rel_f1, "valid_rel_p": rel_p, "valid_rel_r": rel_r
+#         })
+        
+#     return ent_f1, rel_f1
+
+def valid(model, dataloader, epoch, model_type="Cascade", save_dir=None):
     model.eval()
     
-    # 分别统计实体和关系的 X, Y, Z (预测正确数，预测总数，真实总数)
-    ent_total_X, ent_total_Y, ent_total_Z = 0., 0., 0.
-    rel_total_X, rel_total_Y, rel_total_Z = 0., 0., 0.
+    # 初始化统计字典 (TP: 预测正确, Pred: 预测总数, Gold: 真实总数)
+    categories = ["Normal", "SEO", "EPO", "Long", "Overall"]
+    stats = {cat: {"TP": 0, "Pred": 0, "Gold": 0} for cat in categories}
     
+    # 用于统计 Entity F1 (Tensor 方式最准且快)
+    ent_total_X, ent_total_Y, ent_total_Z = 0., 0., 0.
+    
+    # 确保保存目录存在
+    if save_dir and not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
     with torch.no_grad():
-        for batch_data in tqdm(dataloader, desc="Validating"):
+        for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1} Validating"):
+            # A. 动态解包数据
             if model_type == "GPLinker":
-                # GPLinker 模式解包 7 个值
-                (_, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
+                (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
                  batch_ent_labels, batch_hh_labels, batch_tt_labels) = batch_data
-                
-                # 前向传播接收 3 个结果
                 ent_logits, hh_logits, tt_logits = model(
                     batch_input_ids.to(device), 
                     batch_attention_mask.to(device), 
                     batch_token_type_ids.to(device)
                 )
-                
-                # 评估实体
+                rel_out = hh_logits # GPLinker 通常用首首链接作为关系判定依据
+                # 实体 Tensor 统计
                 eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
-                ent_total_X += eX; ent_total_Y += eY; ent_total_Z += eZ
-                
-                # 评估关系 (以 Head-Head 链接作为关系存在性的代理指标)
-                rX, rY, rZ = metrics.get_evaluate_fpr(hh_logits, batch_hh_labels.to(device))
-                rel_total_X += rX; rel_total_Y += rY; rel_total_Z += rZ
             else:
-                # Cascade 模式解包 6 个值
-                (_, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
+                (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
                  batch_ent_labels, batch_rel_labels) = batch_data
-                
-                ent_logits, rel_logits = model(
+                ent_logits, rel_out = model(
                     batch_input_ids.to(device), 
                     batch_attention_mask.to(device), 
                     batch_token_type_ids.to(device)
                 )
-                
-                # 评估实体
+                # 实体 Tensor 统计
                 eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
-                ent_total_X += eX; ent_total_Y += eY; ent_total_Z += eZ
+
+            ent_total_X += eX; ent_total_Y += eY; ent_total_Z += eZ
+
+            # B. 样本级统计
+            for i, sample in enumerate(batch_samples):
+                # 1. 准备真实标签集 (Token 坐标)
+                gold_triples = set()
+                spo_list = sample.get("spo_list", [])
+                for spo in spo_list:
+                    # 获取 Token 级别的坐标 (需确保 DataMaker 预处理时已存入这些字段)
+                    s_tok = spo.get("s_tok_start")
+                    o_tok = spo.get("o_tok_start")
+                    r_id = rel2id.get(spo["predicate"])
+                    if s_tok is not None and o_tok is not None:
+                        gold_triples.add((s_tok, o_tok, r_id))
+
+                # 2. 获取模型预测集
+                # 将阈值暂时调低(如 -2.0)以测试解码通道是否正常，如果发现输出过多可以改回 0
+                pred_triples = decode_triples(rel_out[i], threshold=0) 
+
+
+                # 3. 样本分类判断
+                overlap_cat = get_sample_category(spo_list)
                 
-                # 评估关系
-                rX, rY, rZ = metrics.get_evaluate_fpr(rel_logits, batch_rel_labels.to(device))
-                rel_total_X += rX; rel_total_Y += rY; rel_total_Z += rZ
+                # 4. 更新基础分类统计 (Overall + Normal/SEO/EPO)
+                for cat in ["Overall", overlap_cat]:
+                    stats[cat]["TP"] += len(pred_triples & gold_triples)
+                    stats[cat]["Pred"] += len(pred_triples)
+                    stats[cat]["Gold"] += len(gold_triples)
+                
+                # 5. 更新长实体分类统计
+                long_gold = { (s.get("s_tok_start"), s.get("o_tok_start"), rel2id.get(s["predicate"])) 
+                             for s in spo_list if is_long_triple(s) }
+                # 预测集中过滤出包含长实体的部分 (此步为简化近似)
+                long_pred = { p for p in pred_triples if p in long_gold } 
+                
+                stats["Long"]["TP"] += len(long_pred & long_gold)
+                stats["Long"]["Pred"] += len(long_pred)
+                stats["Long"]["Gold"] += len(long_gold)
 
-    # 1. 计算 Entity 指标
+    # C. 计算指标并生成报告
+    # 计算 Entity 指标
     ent_f1 = 2 * ent_total_X / (ent_total_Y + ent_total_Z) if (ent_total_Y + ent_total_Z) > 0 else 0
-    ent_p = ent_total_X / ent_total_Y if ent_total_Y > 0 else 0
-    ent_r = ent_total_X / ent_total_Z if ent_total_Z > 0 else 0
+    results = {"Entity": ent_f1}
     
-    # 2. 计算 Relation 指标
-    rel_f1 = 2 * rel_total_X / (rel_total_Y + rel_total_Z) if (rel_total_Y + rel_total_Z) > 0 else 0
-    rel_p = rel_total_X / rel_total_Y if rel_total_Y > 0 else 0
-    rel_r = rel_total_X / rel_total_Z if rel_total_Z > 0 else 0
+    report = f"\n{'='*45}\n"
+    report += f"Epoch: {epoch + 1} | Model Type: {model_type}\n"
+    report += f"{'-'*45}\n"
+    report += f"Entity F1: {ent_f1:.4f}\n"
+    report += f"{'-'*45}\n"
+    report += f"{'Category':<10} | {'P':<6} | {'R':<6} | {'F1':<6}\n"
+    report += f"{'-'*45}\n"
+    
+    for cat in categories:
+        s = stats[cat]
+        p = s["TP"] / s["Pred"] if s["Pred"] > 0 else 0
+        r = s["TP"] / s["Gold"] if s["Gold"] > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        results[cat] = f1
+        report += f"{cat:<10} | {p:.4f} | {r:.4f} | {f1:.4f}\n"
+    report += f"{'='*45}\n"
 
-    # 打印评估结果
-    print("\n" + "="*40)
-    print(f"Model Type: {model_type} | Epoch: {epoch + 1}")
-    print(f"[Entity]   P: {ent_p:.4f}, R: {ent_r:.4f}, F1: {ent_f1:.4f}")
-    print(f"[Relation] P: {rel_p:.4f}, R: {rel_r:.4f}, F1: {rel_f1:.4f}")
-    print("="*40 + "\n")
+    # D. 输出与记录
+    print(report)
+    
+    # 记录到本地 TXT 文件
+    if save_dir:
+        log_path = os.path.join(save_dir, f"{model_type}_fine_grained_eval.txt")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(report + "\n")
     
     # 记录到 Wandb
     if conf["logger"] == "wandb":
-        logger.log({
-            "epoch": epoch,
-            "valid_ent_f1": ent_f1, "valid_ent_p": ent_p, "valid_ent_r": ent_r,
-            "valid_rel_f1": rel_f1, "valid_rel_p": rel_p, "valid_rel_r": rel_r
-        })
-        
-    return ent_f1, rel_f1
+        logger.log({**{f"valid_{k.lower()}_f1": v for k, v in results.items()}, "epoch": epoch})
+
+    return results
 
 
 import matplotlib.pyplot as plt
@@ -620,37 +787,37 @@ if __name__ == '__main__':
         model_type = getattr(args, 'model_type', 'Cascade') 
         train_dataloader, valid_dataloader = data_generator(model_type=model_type)
 
-        # 2. 根据模型类型初始化
+        # 2. 根据模型类型初始化模型与损失函数
         if model_type == "GPLinker":
             model = GPLinker(encoder, ent_type_size, rel_type_size, inner_dim=64)
             criterion = GPLinkerLoss()
-            # GPLinker 通常有 3 个 scale: ent, hh, tt
-            log_header = "epoch\ts_ent\ts_hh\ts_tt\tent_f1\trel_f1\n"
+            # GPLinker 有 3 个 scale: ent, hh, tt
+            log_header = "epoch\ts_ent\ts_hh\ts_tt\tent_f1\trel_overall\tnormal_f1\tseo_f1\tepo_f1\tlong_f1\n"
         else:
             model = JointCascadeGlobalPointer(encoder, ent_type_size, rel_type_size, inner_dim=64,
                                               use_boundary_attn=use_boundary_attn_bool,
                                               use_dynamic_gate=use_dynamic_gate_bool)
             criterion = JointExtractionLoss()
             # Cascade 有 2 个 scale: ent, rel
-            log_header = "epoch\ts_ent\ts_rel\tent_f1\trel_f1\n"
+            log_header = "epoch\ts_ent\ts_rel\tent_f1\trel_overall\tnormal_f1\tseo_f1\tepo_f1\tlong_f1\n"
 
-        # 3. 移动到设备（必须在初始化优化器之前）
+        # 3. 移动到设备
         model = model.to(device)
         criterion = criterion.to(device)
 
-        # 4. 初始化日志文件
-        log_txt_path = os.path.join(model_state_dict_dir, f"{model_type}_loss_scales.txt")
+        # 4. 初始化详细日志文件
+        log_txt_path = os.path.join(model_state_dict_dir, f"{model_type}_detailed_results.txt")
         with open(log_txt_path, 'w', encoding='utf-8') as f:
             f.write(log_header)
 
-        # 5. 统一初始化优化器（只初始化一次）
+        # 5. 统一初始化优化器
         optimizer_params = [{'params': model.parameters()}]
         if hasattr(criterion, 'loss_scales'):
             optimizer_params.append({'params': criterion.loss_scales, 'weight_decay': 0.0})
         
         optimizer = torch.optim.Adam(optimizer_params, lr=float(hyper_parameters["lr"]))
 
-        # 6. 设置调度器
+        # 6. 设置调度器 (CAWR)
         scheduler = None
         if hyper_parameters.get("scheduler") == "CAWR":
             T_0 = hyper_parameters.get("rewarm_epoch_num", 2)
@@ -662,19 +829,36 @@ if __name__ == '__main__':
         max_rel_f1 = 0.
         
         for epoch in range(hyper_parameters["epochs"]):
-            # 注意：传入 model_type 确保 train/valid 内部解包正确
+            # --- 训练阶段 ---
             avg_loss = train(model, train_dataloader, epoch, optimizer, model_type=model_type)
-            ent_f1, current_rel_f1 = valid(model, valid_dataloader, epoch, model_type=model_type)
-
-            # 8. 动态记录 Loss Scales
+            
+            # --- 验证阶段：获取包含细粒度分数的字典 ---
+            # 注意：需确保你的 valid 函数返回结果字典
+            results_dict = valid(model, valid_dataloader, epoch, model_type=model_type, save_dir=model_state_dict_dir)
+            
+            # 正确提取各列分数
+            ent_f1 = results_dict["Entity"]
+            current_rel_f1 = results_dict["Overall"]
+            
+            # --- 8. 动态记录 Loss Scales 与 细粒度 F1 ---
             scales = criterion.loss_scales.detach().cpu().numpy()
             scale_str = "\t".join([f"{s:.6f}" for s in scales])
             
-            with open(log_txt_path, 'a', encoding='utf-8') as f:
-                f.write(f"{epoch+1}\t{scale_str}\t{ent_f1:.4f}\t{current_rel_f1:.4f}\n")
+            # 构造写入 TXT 的细粒度分数
+            fine_grained_str = (
+                f"{results_dict['Normal']:.4f}\t"
+                f"{results_dict['SEO']:.4f}\t"
+                f"{results_dict['EPO']:.4f}\t"
+                f"{results_dict['Long']:.4f}"
+            )
             
-            print(f"--> Epoch {epoch+1} {model_type} scales saved: {scale_str}")
+            # 写入 detailed_results.txt
+            with open(log_txt_path, 'a', encoding='utf-8') as f:
+                f.write(f"{epoch+1}\t{scale_str}\t{ent_f1:.4f}\t{current_rel_f1:.4f}\t{fine_grained_str}\n")
+            
+            print(f"--> Epoch {epoch+1} {model_type} results saved to {log_txt_path}")
 
+            # 更新调度器
             if scheduler is not None:
                 scheduler.step()
 
@@ -683,14 +867,15 @@ if __name__ == '__main__':
             history['ent_f1'].append(ent_f1)
             history['rel_f1'].append(current_rel_f1)
 
-            # 保存最优模型
+            # --- 保存最优模型 ---
             if current_rel_f1 > max_rel_f1:
                 max_rel_f1 = current_rel_f1
                 if current_rel_f1 > conf.get("f1_2_save", 0.1): 
-                    save_path = os.path.join(model_state_dict_dir, f"{model_type}_best_f1_{max_rel_f1:.4f}.pt")
+                    save_path = os.path.join(model_state_dict_dir, f"{model_type}_best_rel_f1_{max_rel_f1:.4f}.pt")
                     torch.save(model.state_dict(), save_path)
-                    print(f"--> Saved best {model_type} model to {save_path}")
+                    print(f"--> Saved best {model_type} model with F1: {max_rel_f1:.4f}")
             
             print(f"Best Relation F1 so far: {max_rel_f1:.4f}")
 
-        plot_simplified_metrics(history, save_path=os.path.join(model_state_dict_dir, f"{model_type}_results.png"))
+        # 绘制训练曲线
+        plot_simplified_metrics(history, save_path=os.path.join(model_state_dict_dir, f"{model_type}_training_plot.png"))
