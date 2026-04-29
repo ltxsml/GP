@@ -789,7 +789,7 @@ if __name__ == '__main__':
 
         # 2. 根据模型类型初始化模型与损失函数
         if model_type == "GPLinker":
-            model = GPLinker(encoder, ent_type_size, rel_type_size, inner_dim=64)
+            model = GPLinker(encoder, ent_type_size, rel_type_size, inner_dim=64, use_boundary_attn=use_boundary_attn_bool)
             criterion = GPLinkerLoss()
             # GPLinker 有 3 个 scale: ent, hh, tt
             log_header = "epoch\ts_ent\ts_hh\ts_tt\tent_f1\trel_overall\tnormal_f1\tseo_f1\tepo_f1\tlong_f1\n"

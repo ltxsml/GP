@@ -11,7 +11,7 @@ common = {
     "data_home": "./datasets",
     "bert_path": "C:\\Users\\26854\\.cache\\huggingface\\hub\\models--Bert-base-chinese\\snapshots\\8f23c25b06e129b6c986331a13d8d025a92cf0ea",  # bert-base-chinese or other plm from https://huggingface.co/models
     "run_type": "train",  # train, eval
-    "f1_2_save": 0.5,  # 存模型的最低f1值
+    "f1_2_save": 0.59,  # 存模型的最低f1值
     "logger": "default"  # wandb or default，default意味着只输出日志到控制台
 }
 
@@ -30,7 +30,7 @@ train_config = {
     "hyper_parameters": {
         "lr": 2e-5,
         "batch_size": 40,
-        "epochs": 70,
+        "epochs": 50,
         "seed": 2333,
         "max_seq_len": 128,
         "scheduler": "CAWR"  # CAWR, Step, None
