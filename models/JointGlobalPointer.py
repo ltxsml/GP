@@ -53,9 +53,19 @@ class JointExtractionLoss(nn.Module):
 
     def multilabel_categorical_crossentropy(self, y_pred, y_true):
         """标准的 Global Pointer 稀疏多标签交叉熵损失"""
+        # 【修正】将 4D 矩阵展平为 2D，否则 logsumexp 会计算错误并加剧梯度爆炸
+        batch_size, type_size = y_pred.shape[:2]
+        y_true = y_true.reshape(batch_size * type_size, -1)
+        y_pred = y_pred.reshape(batch_size * type_size, -1)
+        
+        y_true = y_true.to(y_pred.dtype)
         y_pred = (1 - 2 * y_true) * y_pred
-        y_pred_neg = y_pred - y_true * 1e12
-        y_pred_pos = y_pred - (1 - y_true) * 1e12
+        y_pred_neg = y_pred - y_true * 1e4
+        y_pred_pos = y_pred - (1 - y_true) * 1e4
+        
+        y_pred_neg = y_pred_neg.to(y_pred.dtype)
+        y_pred_pos = y_pred_pos.to(y_pred.dtype)
+        
         zeros = torch.zeros_like(y_pred[..., :1])
         y_pred_neg = torch.cat([y_pred_neg, zeros], dim=-1)
         y_pred_pos = torch.cat([y_pred_pos, zeros], dim=-1)
@@ -253,6 +263,7 @@ class JointCascadeGlobalPointer(nn.Module):
 
         if self.RoPE:
             pos_emb = self.sinusoidal_position_embedding(batch_size, seq_len, self.inner_dim, device)
+            pos_emb = pos_emb.to(qw.dtype) # 对齐半精度，防止隐式提升回 FP32
             cos_pos = pos_emb[..., None, 1::2].repeat_interleave(2, dim=-1)
             sin_pos = pos_emb[..., None, ::2].repeat_interleave(2, dim=-1)
             qw2 = torch.stack([-qw[..., 1::2], qw[..., ::2]], -1).reshape(qw.shape)
@@ -265,12 +276,15 @@ class JointCascadeGlobalPointer(nn.Module):
         # 【深度修正】原版掩码仅能遮蔽 Tail 端的 PAD。当 mask_tril=False 时，会导致 Head 端预测出 PAD。
         # 使用真实的二维十字掩码矩阵：同时遮蔽无效的 Head 和 Tail
         pad_mask = attention_mask.unsqueeze(1).unsqueeze(2) * attention_mask.unsqueeze(1).unsqueeze(3)
-        logits = logits * pad_mask - (1 - pad_mask) * 1e12
+        pad_mask = pad_mask.to(logits.dtype)
+        logits = logits * pad_mask - (1 - pad_mask) * 1e4
         
         if mask_tril:
             mask = torch.tril(torch.ones_like(logits), -1)
-            logits = logits - mask * 1e12
-        return logits / self.inner_dim ** 0.5
+            mask = mask.to(logits.dtype)
+            logits = logits - mask * 1e4
+        logits = logits / (self.inner_dim ** 0.5)
+        return logits.to(hidden_states.dtype)
 
     def forward(self, input_ids, attention_mask, token_type_ids):
         # A. 基础编码
@@ -304,8 +318,8 @@ class JointCascadeGlobalPointer(nn.Module):
         # 2. 科学的 Span-to-Head 跨度注意力机制 (必须进行加权归一化)
         # 恢复 sum：保留实体类型维度的量子叠加态（解决一词多义重叠问题）
         span_attn = torch.sum(ent_prob, dim=1) # [batch, seq_head, seq_tail] 
-        # 关键修正：对跨度注意力权重进行归一化，无论前面怎么叠加，总权重被压缩回 1.0 附近
-        span_attn_weights = span_attn / (torch.sum(span_attn, dim=-1, keepdim=True) + 1e-6)
+        # 关键修正：防止 FP16 下 1e-6 下溢导致 0/0=NaN 的梯度异常
+        span_attn_weights = span_attn / (torch.sum(span_attn, dim=-1, keepdim=True) + 1e-4)
         
         # 利用矩阵乘法，获取加权平均后的尾部上下文
         tail_context = torch.matmul(span_attn_weights, tail_aware_state) 
@@ -405,14 +419,15 @@ class DataMakerJoint(object):
             input_ids = torch.tensor(inputs["input_ids"]).long()
             attention_mask = torch.tensor(inputs["attention_mask"]).long()
             token_type_ids = torch.tensor(inputs["token_type_ids"]).long()
-            ent_labels_ts = torch.tensor(ent_labels).float()
+            # 改用 int8 疏通数据加载瓶颈，到 GPU 后会无损转换
+            ent_labels_ts = torch.tensor(ent_labels, dtype=torch.int8)
             
             if model_type == "GPLinker":
-                hh_labels_ts = torch.tensor(hh_labels).float()
-                tt_labels_ts = torch.tensor(tt_labels).float()
+                hh_labels_ts = torch.tensor(hh_labels, dtype=torch.int8)
+                tt_labels_ts = torch.tensor(tt_labels, dtype=torch.int8)
                 all_inputs.append((sample, input_ids, attention_mask, token_type_ids, ent_labels_ts, hh_labels_ts, tt_labels_ts))
             else:
-                rel_labels_ts = torch.tensor(rel_labels).float()
+                rel_labels_ts = torch.tensor(rel_labels, dtype=torch.int8)
                 all_inputs.append((sample, input_ids, attention_mask, token_type_ids, ent_labels_ts, rel_labels_ts))
             
         return all_inputs
@@ -491,6 +506,7 @@ class GPLinker(nn.Module):
 
         if self.RoPE:
             pos_emb = self.sinusoidal_position_embedding(batch_size, seq_len, self.inner_dim, device)
+            pos_emb = pos_emb.to(qw.dtype)
             cos_pos = pos_emb[..., None, 1::2].repeat_interleave(2, dim=-1)
             sin_pos = pos_emb[..., None, ::2].repeat_interleave(2, dim=-1)
             qw2 = torch.stack([-qw[..., 1::2], qw[..., ::2]], -1).reshape(qw.shape)
@@ -502,12 +518,15 @@ class GPLinker(nn.Module):
         
         # 同样修正 GPLinker 中的 PAD 掩码逻辑
         pad_mask = attention_mask.unsqueeze(1).unsqueeze(2) * attention_mask.unsqueeze(1).unsqueeze(3)
-        logits = logits * pad_mask - (1 - pad_mask) * 1e12
+        pad_mask = pad_mask.to(logits.dtype)
+        logits = logits * pad_mask - (1 - pad_mask) * 1e4
         
         if mask_tril:
             mask = torch.tril(torch.ones_like(logits), -1)
-            logits = logits - mask * 1e12
-        return logits / self.inner_dim ** 0.5
+            mask = mask.to(logits.dtype)
+            logits = logits - mask * 1e4
+        logits = logits / (self.inner_dim ** 0.5)
+        return logits.to(hidden_states.dtype)
 
     def forward(self, input_ids, attention_mask, token_type_ids):
         context_outputs = self.encoder(input_ids, attention_mask, token_type_ids)
@@ -537,9 +556,18 @@ class GPLinkerLoss(nn.Module):
 
     def multilabel_categorical_crossentropy(self, y_pred, y_true):
         # 复用你代码中原有的多标签交叉熵逻辑
+        batch_size, type_size = y_pred.shape[:2]
+        y_true = y_true.reshape(batch_size * type_size, -1)
+        y_pred = y_pred.reshape(batch_size * type_size, -1)
+
+        y_true = y_true.to(y_pred.dtype)
         y_pred = (1 - 2 * y_true) * y_pred
-        y_pred_neg = y_pred - y_true * 1e12
-        y_pred_pos = y_pred - (1 - y_true) * 1e12
+        y_pred_neg = y_pred - y_true * 1e4
+        y_pred_pos = y_pred - (1 - y_true) * 1e4
+        
+        y_pred_neg = y_pred_neg.to(y_pred.dtype)
+        y_pred_pos = y_pred_pos.to(y_pred.dtype)
+        
         zeros = torch.zeros_like(y_pred[..., :1])
         y_pred_neg = torch.cat([y_pred_neg, zeros], dim=-1)
         y_pred_pos = torch.cat([y_pred_pos, zeros], dim=-1)

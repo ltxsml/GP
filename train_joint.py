@@ -442,7 +442,7 @@ optimizer_params = [
     ]
 optimizer = torch.optim.Adam(optimizer_params, lr=float(hyper_parameters["lr"]))
 
-def train_step(batch_data, model, optimizer, criterion, model_type="Cascade"):
+def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Cascade"):
     # 1. 根据模型类型动态解包 batch_data
     if model_type == "GPLinker":
         (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
@@ -462,34 +462,37 @@ def train_step(batch_data, model, optimizer, criterion, model_type="Cascade"):
 
     optimizer.zero_grad()
     
-    # 2. 根据模型输出数量进行分支处理
-    if model_type == "GPLinker":
-        # GPLinker 返回三个 Logits: 实体, 首首链接, 尾尾链接
-        ent_logits, hh_logits, tt_logits = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
-        # 调用相应的 GPLinker 损失计算逻辑
-        total_loss, loss_ent, l_hh, l_tt = criterion(ent_logits, batch_ent_labels, hh_logits, batch_hh_labels, tt_logits, batch_tt_labels)
-        # 为了进度条显示兼容，将关系链接损失取平均
-        loss_rel = (l_hh + l_tt) / 2
-    else:
-        ent_logits, rel_logits = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
-        total_loss, loss_ent, loss_rel = criterion(
-            ent_logits, batch_ent_labels, 
-            rel_logits, batch_rel_labels
-        )
+    # 2. 启用自动混合精度计算
+    with torch.cuda.amp.autocast():
+        if model_type == "GPLinker":
+            # GPLinker 返回三个 Logits: 实体, 首首链接, 尾尾链接
+            ent_logits, hh_logits, tt_logits = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+            # 调用相应的 GPLinker 损失计算逻辑
+            total_loss, loss_ent, l_hh, l_tt = criterion(ent_logits, batch_ent_labels, hh_logits, batch_hh_labels, tt_logits, batch_tt_labels)
+            # 为了进度条显示兼容，将关系链接损失取平均
+            loss_rel = (l_hh + l_tt) / 2
+        else:
+            ent_logits, rel_logits = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+            total_loss, loss_ent, loss_rel = criterion(
+                ent_logits, batch_ent_labels, 
+                rel_logits, batch_rel_labels
+            )
     
-    total_loss.backward()
-    optimizer.step()
+    # 3. 使用 Scaler 缩放并反向传播
+    scaler.scale(total_loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
 
     return total_loss.item(), loss_ent.item(), loss_rel.item()
 
-def train(model, dataloader, epoch, optimizer, model_type="Cascade"):
+def train(model, dataloader, epoch, optimizer, scaler, model_type="Cascade"):
     model.train()
     pbar = tqdm(enumerate(dataloader), total=len(dataloader))
     
     total_loss_sum = 0.
     for batch_ind, batch_data in pbar:
         # 增加 model_type 参数传递
-        loss, l_ent, l_rel = train_step(batch_data, model, optimizer, criterion, model_type=model_type)
+        loss, l_ent, l_rel = train_step(batch_data, model, optimizer, criterion, scaler, model_type=model_type)
         total_loss_sum += loss
         avg_loss = total_loss_sum / (batch_ind + 1)
         
@@ -646,27 +649,28 @@ def valid(model, dataloader, epoch, model_type="Cascade", save_dir=None):
     with torch.no_grad():
         for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1} Validating"):
             # A. 动态解包数据
-            if model_type == "GPLinker":
-                (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
-                 batch_ent_labels, batch_hh_labels, batch_tt_labels) = batch_data
-                ent_logits, hh_logits, tt_logits = model(
-                    batch_input_ids.to(device), 
-                    batch_attention_mask.to(device), 
-                    batch_token_type_ids.to(device)
-                )
-                rel_out = hh_logits # GPLinker 通常用首首链接作为关系判定依据
-                # 实体 Tensor 统计
-                eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
-            else:
-                (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
-                 batch_ent_labels, batch_rel_labels) = batch_data
-                ent_logits, rel_out = model(
-                    batch_input_ids.to(device), 
-                    batch_attention_mask.to(device), 
-                    batch_token_type_ids.to(device)
-                )
-                # 实体 Tensor 统计
-                eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
+            with torch.cuda.amp.autocast():
+                if model_type == "GPLinker":
+                    (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
+                     batch_ent_labels, batch_hh_labels, batch_tt_labels) = batch_data
+                    ent_logits, hh_logits, tt_logits = model(
+                        batch_input_ids.to(device), 
+                        batch_attention_mask.to(device), 
+                        batch_token_type_ids.to(device)
+                    )
+                    rel_out = hh_logits # GPLinker 通常用首首链接作为关系判定依据
+                    # 实体 Tensor 统计
+                    eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
+                else:
+                    (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
+                     batch_ent_labels, batch_rel_labels) = batch_data
+                    ent_logits, rel_out = model(
+                        batch_input_ids.to(device), 
+                        batch_attention_mask.to(device), 
+                        batch_token_type_ids.to(device)
+                    )
+                    # 实体 Tensor 统计
+                    eX, eY, eZ = metrics.get_evaluate_fpr(ent_logits, batch_ent_labels.to(device))
 
             ent_total_X += eX; ent_total_Y += eY; ent_total_Z += eZ
 
@@ -824,13 +828,16 @@ if __name__ == '__main__':
             T_mult = hyper_parameters.get("T_mult", 1)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult)
 
+        # 初始化 AMP Scaler
+        scaler = torch.cuda.amp.GradScaler()
+
         # 7. 训练循环
         history = {'total_loss': [], 'ent_f1': [], 'rel_f1': []}
         max_rel_f1 = 0.
         
         for epoch in range(hyper_parameters["epochs"]):
             # --- 训练阶段 ---
-            avg_loss = train(model, train_dataloader, epoch, optimizer, model_type=model_type)
+            avg_loss = train(model, train_dataloader, epoch, optimizer, scaler, model_type=model_type)
             
             # --- 验证阶段：获取包含细粒度分数的字典 ---
             # 注意：需确保你的 valid 函数返回结果字典
