@@ -438,28 +438,27 @@ criterion = JointExtractionLoss().to(device)
 metrics = MetricsCalculator()
 
 # ====== 【提分修改】新增 FGM 对抗训练类 ======
-# class FGM():
-#     def __init__(self, model):
-#         self.model = model
-#         self.backup = {}
+class FGM():
+    def __init__(self, model):
+        self.model = model
+        self.backup = {}
 
-#     def attack(self, epsilon=1., emb_name='word_embeddings'):
-#         for name, param in self.model.named_parameters():
-#             if param.requires_grad and emb_name in name:
-#                 self.backup[name] = param.data.clone()
-#                 norm = torch.norm(param.grad)
-#                 if norm != 0 and not torch.isnan(norm):
-#                     r_at = epsilon * param.grad / norm
-#                     param.data.add_(r_at)
+    def attack(self, epsilon=1., emb_name='word_embeddings'):
+        for name, param in self.model.named_parameters():
+            # 增加 param.grad is not None 判断，防止某些未使用的参数导致报错
+            if param.requires_grad and emb_name in name and param.grad is not None:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0 and not torch.isnan(norm):
+                    r_at = epsilon * param.grad / norm
+                    param.data.add_(r_at)
 
-#     def restore(self, emb_name='word_embeddings'):
-#         for name, param in self.model.named_parameters():
-#             if param.requires_grad and emb_name in name:
-#                 assert name in self.backup
-#                 param.data = self.backup[name]
-#         self.backup = {}
-
-# fgm = FGM(model)
+    def restore(self, emb_name='word_embeddings'):
+        for name, param in self.model.named_parameters():
+            # 增加 name in self.backup 判断，与 attack 阶段的安全检查呼应
+            if param.requires_grad and emb_name in name and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
 
 def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Cascade"):
     # 1. 根据模型类型动态解包 batch_data
@@ -501,20 +500,21 @@ def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Casc
     scaler.scale(total_loss).backward()
     
     # ====== 【提分修改】执行对抗训练 ======
+    fgm_obj = FGM(model)
     # a. 在 Embedding 层添加扰动
-    # fgm_obj.attack()
-    # # b. 在扰动基础上再次前向传播
-    # with torch.cuda.amp.autocast():
-    #     if model_type == "GPLinker":
-    #         ent_logits_adv, hh_logits_adv, tt_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
-    #         total_loss_adv, _, _, _ = criterion(ent_logits_adv, batch_ent_labels, hh_logits_adv, batch_hh_labels, tt_logits_adv, batch_tt_labels)
-    #     else:
-    #         ent_logits_adv, rel_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
-    #         total_loss_adv, _, _ = criterion(ent_logits_adv, batch_ent_labels, rel_logits_adv, batch_rel_labels)
-    # # c. 反向传播累加对抗梯度
-    # scaler.scale(total_loss_adv).backward()
-    # # d. 恢复 Embedding 参数
-    # fgm_obj.restore()
+    fgm_obj.attack()
+    # b. 在扰动基础上再次前向传播
+    with torch.cuda.amp.autocast():
+        if model_type == "GPLinker":
+            ent_logits_adv, hh_logits_adv, tt_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+            total_loss_adv, _, _, _ = criterion(ent_logits_adv, batch_ent_labels, hh_logits_adv, batch_hh_labels, tt_logits_adv, batch_tt_labels)
+        else:
+            ent_logits_adv, rel_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+            total_loss_adv, _, _ = criterion(ent_logits_adv, batch_ent_labels, rel_logits_adv, batch_rel_labels)
+    # c. 反向传播累加对抗梯度
+    scaler.scale(total_loss_adv).backward()
+    # d. 恢复 Embedding 参数
+    fgm_obj.restore()
     # =====================================
 
     # 4. 参数更新

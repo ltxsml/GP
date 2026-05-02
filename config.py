@@ -30,7 +30,7 @@ train_config = {
     "hyper_parameters": {
         "lr": 2e-5,
         "batch_size": 64,
-        "epochs": 50,
+        "epochs": 70,
         "seed": 2333,
         "max_seq_len": 128,
         "scheduler": "CAWR"  # 
@@ -53,8 +53,8 @@ eval_config = {
 
 cawr_scheduler = {
     # CosineAnnealingWarmRestarts
-    "T_mult": 1,
-    "rewarm_epoch_num": 2,
+    "T_mult": 2,  # 每次退火重启的周期长度翻倍
+    "rewarm_epoch_num": 5,  # 初始第一个退火周期为5个Epoch
 }
 step_scheduler = {
     # StepLR
