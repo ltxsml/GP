@@ -202,7 +202,8 @@ class JointExtractionLoss(nn.Module):
 
 class JointCascadeGlobalPointer(nn.Module):
     def __init__(self, encoder, ent_type_size, rel_type_size, inner_dim, 
-                 use_boundary_attn=True, use_dynamic_gate=True, RoPE=True):
+                 use_boundary_attn=True, use_dynamic_gate=True, RoPE=True, 
+                 use_mlp_rel=True): # ====== 新增：关系抽取层结构兼容开关 ======
         super().__init__()
         self.encoder = encoder
         self.ent_type_size = ent_type_size
@@ -212,6 +213,7 @@ class JointCascadeGlobalPointer(nn.Module):
         self.use_dynamic_gate = use_dynamic_gate
         self.RoPE = RoPE
         self.use_boundary_attn = use_boundary_attn
+        self.use_mlp_rel = use_mlp_rel
         
         # 1. 解耦边界门控组件
         self.boundary_gate = DecoupledBoundaryGate(self.hidden_size)
@@ -234,13 +236,17 @@ class JointCascadeGlobalPointer(nn.Module):
             )
 
         # 5. 关系抽取层：输入维度固定为 hidden_size * 2 (原始 + 先验)
-        # 【提分修改】将单层 Linear 升级为 MLP，充分融合并提取高阶先验特征
-        self.rel_dense = nn.Sequential(
-            nn.Linear(self.hidden_size * 2, self.hidden_size),
-            nn.LayerNorm(self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.rel_type_size * self.inner_dim * 2)
-        )
+        # 根据开关动态选择结构，以兼容加载老版本训练的模型权重
+        if self.use_mlp_rel:
+            self.rel_dense = nn.Sequential(
+                nn.Linear(self.hidden_size * 2, self.hidden_size * 2), # 修复 1：保持 1536 维，不制造信息瓶颈
+                # 修复 2：移除 LayerNorm，保护 GlobalPointer 点乘所需的特征绝对幅值
+                nn.GELU(),
+                nn.Dropout(0.1),                                       # 修复 3：引入 Dropout 防止多层网络的过拟合
+                nn.Linear(self.hidden_size * 2, self.rel_type_size * self.inner_dim * 2)
+            )
+        else:
+            self.rel_dense = nn.Linear(self.hidden_size * 2, self.rel_type_size * self.inner_dim * 2)
 
     def sinusoidal_position_embedding(self, batch_size, seq_len, output_dim, device):
         position_ids = torch.arange(0, seq_len, dtype=torch.float, device=device).unsqueeze(-1)

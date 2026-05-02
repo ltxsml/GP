@@ -436,11 +436,6 @@ model = model.to(device)
 
 criterion = JointExtractionLoss().to(device)
 metrics = MetricsCalculator()
-optimizer_params = [
-        {'params': model.parameters()},
-        {'params': criterion.parameters(), 'weight_decay': 0.0}
-    ]
-optimizer = torch.optim.Adam(optimizer_params, lr=float(hyper_parameters["lr"]))
 
 # ====== 【提分修改】新增 FGM 对抗训练类 ======
 # class FGM():
@@ -859,10 +854,24 @@ if __name__ == '__main__':
 
         # 5. 统一初始化优化器
         optimizer_params = [{'params': model.parameters()}]
+        # 5. 【提分优化】差异化学习率：给随机初始化的顶层分配 5 倍的学习率
+        bert_params = []
+        head_params = []
+        for name, param in model.named_parameters():
+            if "encoder" in name:
+                bert_params.append(param)
+            else:
+                head_params.append(param) # 包括所有的 GP 预测层和 MLP
+                
+        optimizer_params = [
+            {'params': bert_params, 'lr': float(hyper_parameters["lr"])},               # 底层 BERT: 2e-5
+            {'params': head_params, 'lr': float(hyper_parameters["lr"]) * 5.0}          # 顶层随机权重: 1e-4
+        ]
         if hasattr(criterion, 'loss_scales'):
-            optimizer_params.append({'params': criterion.loss_scales, 'weight_decay': 0.0})
-        
-        optimizer = torch.optim.Adam(optimizer_params, lr=float(hyper_parameters["lr"]))
+            # 修复：必须传入 list，且避免重复 append 导致优化器报错或行为异常
+            optimizer_params.append({'params': [criterion.loss_scales], 'weight_decay': 0.0, 'lr': float(hyper_parameters["lr"]) * 5.0})
+            
+        optimizer = torch.optim.Adam(optimizer_params)
 
         # 6. 设置调度器 (CAWR)
         scheduler = None
