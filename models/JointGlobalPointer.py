@@ -234,7 +234,13 @@ class JointCascadeGlobalPointer(nn.Module):
             )
 
         # 5. 关系抽取层：输入维度固定为 hidden_size * 2 (原始 + 先验)
-        self.rel_dense = nn.Linear(self.hidden_size * 2, self.rel_type_size * self.inner_dim * 2)
+        # 【提分修改】将单层 Linear 升级为 MLP，充分融合并提取高阶先验特征
+        self.rel_dense = nn.Sequential(
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.rel_type_size * self.inner_dim * 2)
+        )
 
     def sinusoidal_position_embedding(self, batch_size, seq_len, output_dim, device):
         position_ids = torch.arange(0, seq_len, dtype=torch.float, device=device).unsqueeze(-1)

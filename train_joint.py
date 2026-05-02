@@ -442,6 +442,30 @@ optimizer_params = [
     ]
 optimizer = torch.optim.Adam(optimizer_params, lr=float(hyper_parameters["lr"]))
 
+# ====== 【提分修改】新增 FGM 对抗训练类 ======
+# class FGM():
+#     def __init__(self, model):
+#         self.model = model
+#         self.backup = {}
+
+#     def attack(self, epsilon=1., emb_name='word_embeddings'):
+#         for name, param in self.model.named_parameters():
+#             if param.requires_grad and emb_name in name:
+#                 self.backup[name] = param.data.clone()
+#                 norm = torch.norm(param.grad)
+#                 if norm != 0 and not torch.isnan(norm):
+#                     r_at = epsilon * param.grad / norm
+#                     param.data.add_(r_at)
+
+#     def restore(self, emb_name='word_embeddings'):
+#         for name, param in self.model.named_parameters():
+#             if param.requires_grad and emb_name in name:
+#                 assert name in self.backup
+#                 param.data = self.backup[name]
+#         self.backup = {}
+
+# fgm = FGM(model)
+
 def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Cascade"):
     # 1. 根据模型类型动态解包 batch_data
     if model_type == "GPLinker":
@@ -462,7 +486,7 @@ def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Casc
 
     optimizer.zero_grad()
     
-    # 2. 启用自动混合精度计算
+    # 2. 正常前向传播与计算
     with torch.cuda.amp.autocast():
         if model_type == "GPLinker":
             # GPLinker 返回三个 Logits: 实体, 首首链接, 尾尾链接
@@ -478,8 +502,27 @@ def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Casc
                 rel_logits, batch_rel_labels
             )
     
-    # 3. 使用 Scaler 缩放并反向传播
+    # 3. 正常反向传播 (累积梯度)
     scaler.scale(total_loss).backward()
+    
+    # ====== 【提分修改】执行对抗训练 ======
+    # a. 在 Embedding 层添加扰动
+    # fgm_obj.attack()
+    # # b. 在扰动基础上再次前向传播
+    # with torch.cuda.amp.autocast():
+    #     if model_type == "GPLinker":
+    #         ent_logits_adv, hh_logits_adv, tt_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+    #         total_loss_adv, _, _, _ = criterion(ent_logits_adv, batch_ent_labels, hh_logits_adv, batch_hh_labels, tt_logits_adv, batch_tt_labels)
+    #     else:
+    #         ent_logits_adv, rel_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+    #         total_loss_adv, _, _ = criterion(ent_logits_adv, batch_ent_labels, rel_logits_adv, batch_rel_labels)
+    # # c. 反向传播累加对抗梯度
+    # scaler.scale(total_loss_adv).backward()
+    # # d. 恢复 Embedding 参数
+    # fgm_obj.restore()
+    # =====================================
+
+    # 4. 参数更新
     scaler.step(optimizer)
     scaler.update()
 
@@ -837,7 +880,7 @@ if __name__ == '__main__':
         
         for epoch in range(hyper_parameters["epochs"]):
             # --- 训练阶段 ---
-            avg_loss = train(model, train_dataloader, epoch, optimizer, scaler, model_type=model_type)
+            avg_loss = train(model, train_dataloader, epoch, optimizer, scaler,  model_type=model_type)
             
             # --- 验证阶段：获取包含细粒度分数的字典 ---
             # 注意：需确保你的 valid 函数返回结果字典

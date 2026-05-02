@@ -33,7 +33,7 @@ train_config = {
         "epochs": 50,
         "seed": 2333,
         "max_seq_len": 128,
-        "scheduler": "CAWR"  # CAWR, Step, None
+        "scheduler": "CAWR"  # 
     }
 }
 
