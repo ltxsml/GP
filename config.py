@@ -28,9 +28,9 @@ train_config = {
     "ent2id": "ent2id.json",
     "path_to_save_model": "./outputs",  # 在logger不是wandb时生效
     "hyper_parameters": {
-        "lr": 2e-5,
+        "lr": 2.5e-5,
         "batch_size": 64,
-        "epochs": 70,
+        "epochs": 50,  # 总训练轮数增加到 50 轮
         "seed": 2333,
         "max_seq_len": 128,
         "scheduler": "CAWR"  # 
@@ -53,8 +53,10 @@ eval_config = {
 
 cawr_scheduler = {
     # CosineAnnealingWarmRestarts
-    "T_mult": 2,  # 每次退火重启的周期长度翻倍
-    "rewarm_epoch_num": 5,  # 初始第一个退火周期为5个Epoch
+    "T_mult": 4,  # 开启放大：第二周期长度是第一周期的 4 倍
+    "rewarm_epoch_num": 10, # 第1周期10轮，第2周期40轮 (10+40=50，刚好在最后降落)
+    "eta_min": 1e-6,  # 学习率的最小值，建议设为极小值而非绝对的 0
+    "eta_max_decay_rate": 0.5,  # 每次重启时最高学习率的衰减率 (0.5 表示每次重启最高点减半)
 }
 step_scheduler = {
     # StepLR

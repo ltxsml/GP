@@ -267,11 +267,11 @@ class JointCascadeGlobalPointer(nn.Module):
         qw, kw = outputs[..., :self.inner_dim], outputs[..., self.inner_dim:]
 
         # 【核心注入】使用门控概率对 Query 和 Key 进行硬性特征缩放
-        # 改为“软门控 (Soft Gate)”：不彻底抹杀特征，保留 20% 的底噪，
-        # 给予下游矩阵纠错空间，有效挽救因门控过于自信而丢失的短实体。
-        base_ratio = 0.1 # 稍微收紧门控，尝试提升精确率
-        if q_gate is not None: qw = qw * (q_gate.unsqueeze(-1) * (1 - base_ratio) + base_ratio)
-        if k_gate is not None: kw = kw * (k_gate.unsqueeze(-1) * (1 - base_ratio) + base_ratio)
+        # 【提分修正】改为“残差软门控 (Residual Soft Gate)”
+        # 原本的乘法门控在缺乏边界显式监督时，容易在训练初期过滤掉正确特征，导致梯度消失。
+        # 改为残差结构：1.0 保留原始信息，gate 提供特征增强。门控为 0 时不丢特征，为 1 时特征翻倍。
+        if q_gate is not None: qw = qw * (1.0 + q_gate.unsqueeze(-1))
+        if k_gate is not None: kw = kw * (1.0 + k_gate.unsqueeze(-1))
 
         if self.RoPE:
             pos_emb = self.sinusoidal_position_embedding(batch_size, seq_len, self.inner_dim, device)
@@ -338,12 +338,14 @@ class JointCascadeGlobalPointer(nn.Module):
         tail_context_features = torch.relu(self.tail_context_proj(tail_context))
 
         # F. 动态门控提纯与特征融合
+        # 3. 融合：既包含头部的类型概率先验，又包含了完整的尾部跨度语义
+        ent_prior_features = base_prior_features + tail_context_features
+
         if self.use_dynamic_gate:
-            # 3. 融合：既包含头部的类型概率先验，又包含了完整的尾部跨度语义
-            ent_prior_features = base_prior_features + tail_context_features
             gate_input = torch.cat([last_hidden_state, ent_prior_features], dim=-1)
-            gate_value = self.gate_network(gate_input) 
-            final_ent_features = gate_value * ent_prior_features 
+            gate_value = self.gate_network(gate_input)
+            # 【核心优化】从“硬乘法”改为更稳定的“软融合门控”
+            final_ent_features = (1 - gate_value) * last_hidden_state + gate_value * ent_prior_features
         else:
             final_ent_features = ent_prior_features
 
@@ -511,10 +513,9 @@ class GPLinker(nn.Module):
         qw, kw = outputs[..., :self.inner_dim], outputs[..., self.inner_dim:]
 
         # 特征缩放
-        # 同样在 GPLinker 中应用软门控
-        base_ratio = 0.2
-        if q_gate is not None: qw = qw * (q_gate.unsqueeze(-1) * (1 - base_ratio) + base_ratio)
-        if k_gate is not None: kw = kw * (k_gate.unsqueeze(-1) * (1 - base_ratio) + base_ratio)
+        # 同样在 GPLinker 中应用残差软门控
+        if q_gate is not None: qw = qw * (1.0 + q_gate.unsqueeze(-1))
+        if k_gate is not None: kw = kw * (1.0 + k_gate.unsqueeze(-1))
 
         if self.RoPE:
             pos_emb = self.sinusoidal_position_embedding(batch_size, seq_len, self.inner_dim, device)

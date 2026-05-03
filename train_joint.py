@@ -321,6 +321,9 @@ import json
 import time
 import numpy as np
 import glob
+import matplotlib
+matplotlib.use('Agg') # 🚨 强制使用免显示的后端，防止批处理挂机时 GUI 崩溃
+import matplotlib.pyplot as plt
 from transformers import BertTokenizerFast, BertModel
 from tqdm import tqdm
 import wandb
@@ -341,6 +344,7 @@ parser = argparse.ArgumentParser(description="联合抽取消融实验")
 parser.add_argument('--use_dynamic_gate', type=str, default='True')
 parser.add_argument('--use_boundary_attn', type=str, default='True')
 parser.add_argument('--model_type', type=str, default='Cascade', choices=['Cascade', 'GPLinker'])
+parser.add_argument('--use_fgm', type=str, default='False')
 args = parser.parse_args()
 model_type = args.model_type
 
@@ -350,6 +354,7 @@ hyper_parameters = conf["hyper_parameters"]
 # 用命令行参数覆盖默认配置
 use_boundary_attn_bool = True if args.use_boundary_attn == 'True' else False
 use_dynamic_gate_bool = True if args.use_dynamic_gate == 'True' else False
+use_fgm_bool = True if args.use_fgm == 'True' else False
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -460,7 +465,7 @@ class FGM():
                 param.data = self.backup[name]
         self.backup = {}
 
-def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Cascade"):
+def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Cascade", use_fgm=False):
     # 1. 根据模型类型动态解包 batch_data
     if model_type == "GPLinker":
         (batch_samples, batch_input_ids, batch_attention_mask, batch_token_type_ids, 
@@ -499,23 +504,24 @@ def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Casc
     # 3. 正常反向传播 (累积梯度)
     scaler.scale(total_loss).backward()
     
-    # ====== 【提分修改】执行对抗训练 ======
-    fgm_obj = FGM(model)
-    # a. 在 Embedding 层添加扰动
-    fgm_obj.attack()
-    # b. 在扰动基础上再次前向传播
-    with torch.cuda.amp.autocast():
-        if model_type == "GPLinker":
-            ent_logits_adv, hh_logits_adv, tt_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
-            total_loss_adv, _, _, _ = criterion(ent_logits_adv, batch_ent_labels, hh_logits_adv, batch_hh_labels, tt_logits_adv, batch_tt_labels)
-        else:
-            ent_logits_adv, rel_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
-            total_loss_adv, _, _ = criterion(ent_logits_adv, batch_ent_labels, rel_logits_adv, batch_rel_labels)
-    # c. 反向传播累加对抗梯度
-    scaler.scale(total_loss_adv).backward()
-    # d. 恢复 Embedding 参数
-    fgm_obj.restore()
-    # =====================================
+    if use_fgm:
+        # ====== 【提分修改】执行对抗训练 ======
+        fgm_obj = FGM(model)
+        # a. 在 Embedding 层添加扰动
+        fgm_obj.attack()
+        # b. 在扰动基础上再次前向传播
+        with torch.cuda.amp.autocast():
+            if model_type == "GPLinker":
+                ent_logits_adv, hh_logits_adv, tt_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+                total_loss_adv, _, _, _ = criterion(ent_logits_adv, batch_ent_labels, hh_logits_adv, batch_hh_labels, tt_logits_adv, batch_tt_labels)
+            else:
+                ent_logits_adv, rel_logits_adv = model(batch_input_ids, batch_attention_mask, batch_token_type_ids)
+                total_loss_adv, _, _ = criterion(ent_logits_adv, batch_ent_labels, rel_logits_adv, batch_rel_labels)
+        # c. 反向传播累加对抗梯度
+        scaler.scale(total_loss_adv).backward()
+        # d. 恢复 Embedding 参数
+        fgm_obj.restore()
+        # =====================================
 
     # 4. 参数更新
     scaler.step(optimizer)
@@ -523,14 +529,14 @@ def train_step(batch_data, model, optimizer, criterion, scaler, model_type="Casc
 
     return total_loss.item(), loss_ent.item(), loss_rel.item()
 
-def train(model, dataloader, epoch, optimizer, scaler, model_type="Cascade"):
+def train(model, dataloader, epoch, optimizer, scaler, model_type="Cascade", use_fgm=False):
     model.train()
     pbar = tqdm(enumerate(dataloader), total=len(dataloader))
     
     total_loss_sum = 0.
     for batch_ind, batch_data in pbar:
         # 增加 model_type 参数传递
-        loss, l_ent, l_rel = train_step(batch_data, model, optimizer, criterion, scaler, model_type=model_type)
+        loss, l_ent, l_rel = train_step(batch_data, model, optimizer, criterion, scaler, model_type=model_type, use_fgm=use_fgm)
         total_loss_sum += loss
         avg_loss = total_loss_sum / (batch_ind + 1)
         
@@ -787,8 +793,6 @@ def valid(model, dataloader, epoch, model_type="Cascade", save_dir=None):
     return results
 
 
-import matplotlib.pyplot as plt
-
 save_path = random.randint(1000,9999)
 save_path = f"training_results_{save_path}.png"
 
@@ -878,7 +882,8 @@ if __name__ == '__main__':
         if hyper_parameters.get("scheduler") == "CAWR":
             T_0 = hyper_parameters.get("rewarm_epoch_num", 2)
             T_mult = hyper_parameters.get("T_mult", 1)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult)
+            eta_min = float(hyper_parameters.get("eta_min", 1e-6))
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min)
 
         # 初始化 AMP Scaler
         scaler = torch.cuda.amp.GradScaler()
@@ -920,6 +925,15 @@ if __name__ == '__main__':
             # 更新调度器
             if scheduler is not None:
                 scheduler.step()
+                # ====== 新增：动态衰减重启时的最高学习率 ======
+                # 当 T_cur 归零时，说明调度器刚刚完成了一次退火周期的重启
+                if hasattr(scheduler, 'T_cur') and scheduler.T_cur == 0 and epoch < hyper_parameters["epochs"] - 1:
+                    decay_rate = float(hyper_parameters.get("eta_max_decay_rate", 1.0))
+                    if decay_rate < 1.0:
+                        for i, param_group in enumerate(optimizer.param_groups):
+                            scheduler.base_lrs[i] *= decay_rate # 衰减调度器内部记录的最高学习率
+                            param_group['lr'] = scheduler.base_lrs[i] # 强制同步给当前优化器
+                        print(f"\n[LR Scheduler] 🔄 触发退火重启！新周期的最高学习率已衰减 {decay_rate} 倍。")
 
             # 记录历史用于画图
             history['total_loss'].append(avg_loss)
